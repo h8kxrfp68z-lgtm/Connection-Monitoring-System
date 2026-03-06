@@ -53,6 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "telegram_api_host": "api.telegram.org",
         "api_port": 443,
         "ipv4_only": True,
+        "proxy_url": "",
         "public_dns_resolvers": ["1.1.1.1", "8.8.8.8"],
     },
     "intervals_sec": {
@@ -164,6 +165,86 @@ def parse_json_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _find_default_config_path() -> Path:
+    env_cfg = os.getenv("NETDIAG_CONFIG")
+    if env_cfg:
+        return Path(env_cfg).expanduser().resolve()
+    script_dir = Path(__file__).resolve().parent
+    candidate = script_dir.parent / "references" / "config.example.json"
+    return candidate.resolve()
+
+
+def _parse_proxy_host_port(proxy_url: str) -> tuple[str, int] | None:
+    value = (proxy_url or "").strip()
+    if not value:
+        return None
+    m = re.match(r"^(?:(?:http|https)://)?([A-Za-z0-9._-]+)(?::(\d+))?$", value)
+    if not m:
+        return None
+    host = m.group(1)
+    port = int(m.group(2) or 8080)
+    return host, port
+
+
+def validate_config_errors(cfg: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+
+    if not cfg.get("telegram", {}).get("bot_token"):
+        errors.append("telegram.bot_token is required")
+    if not cfg.get("telegram", {}).get("personal_chat_id"):
+        errors.append("telegram.personal_chat_id is required")
+
+    mode = cfg.get("delivery_verification", {}).get("mode")
+    if mode not in {"bot_api_ack", "user_reply_ack", "callback_ack"}:
+        errors.append("delivery_verification.mode must be one of: bot_api_ack, user_reply_ack, callback_ack")
+
+    verbosity = str(cfg.get("logging", {}).get("verbosity"))
+    if verbosity not in VERBOSITY_MAX_LEVEL:
+        errors.append("logging.verbosity must be one of: normal, debug, trace")
+
+    for section, key in [
+        ("intervals_sec", "ping"),
+        ("intervals_sec", "traceroute"),
+        ("intervals_sec", "dns_reresolve"),
+        ("intervals_sec", "mtu_test"),
+        ("timeouts_ms", "connect"),
+        ("timeouts_ms", "request"),
+        ("timeouts_ms", "delivery_ack"),
+        ("timeouts_ms", "subprocess"),
+    ]:
+        try:
+            value = int(cfg[section][key])
+            if value <= 0:
+                errors.append(f"{section}.{key} must be > 0")
+        except Exception:
+            errors.append(f"{section}.{key} must be an integer > 0")
+
+    try:
+        max_total = int(cfg["logging"]["max_total_size_mb"])
+        if max_total <= 0:
+            errors.append("logging.max_total_size_mb must be > 0")
+    except Exception:
+        errors.append("logging.max_total_size_mb must be an integer > 0")
+
+    try:
+        max_file = int(cfg["logging"]["max_file_size_mb"])
+        if max_file <= 0:
+            errors.append("logging.max_file_size_mb must be > 0")
+    except Exception:
+        errors.append("logging.max_file_size_mb must be an integer > 0")
+        max_file = None
+
+    if 'max_total' in locals() and 'max_file' in locals() and isinstance(max_total, int) and isinstance(max_file, int):
+        if max_file > max_total:
+            errors.append("logging.max_file_size_mb must be <= logging.max_total_size_mb")
+
+    proxy_value = str(cfg.get("network", {}).get("proxy_url") or "").strip()
+    if proxy_value and _parse_proxy_host_port(proxy_value) is None:
+        errors.append("network.proxy_url must be like http://127.0.0.1:1082")
+
+    return errors
+
+
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -273,6 +354,8 @@ class NetworkDiagnosticWorker:
 
         self.telegram_host: str = str(config["network"]["telegram_api_host"])
         self.telegram_port: int = int(config["network"]["api_port"])
+        self.proxy_url: str = str(config["network"].get("proxy_url", "") or "").strip()
+        self.proxy_endpoint = _parse_proxy_host_port(self.proxy_url)
         self.bot_token: str = str(config["telegram"]["bot_token"])
         self.personal_chat_id: str = str(config["telegram"]["personal_chat_id"])
 
@@ -424,6 +507,7 @@ class NetworkDiagnosticWorker:
                 "log_path": str(self.log_path),
                 "summary_path": str(self.summary_path),
                 "delivery_mode": self.delivery_mode,
+                "proxy_url": self.proxy_url or None,
             },
         )
 
@@ -1248,10 +1332,33 @@ class NetworkDiagnosticWorker:
             self.enable_keepalive(sock, tls_data["keepalive"])
 
             connect_started = time.perf_counter()
-            sock.connect((destination_ip, destination_port))
+            target_host, target_port = destination_ip, destination_port
+            if self.proxy_endpoint is not None:
+                target_host, target_port = self.proxy_endpoint
+            sock.connect((target_host, target_port))
             connect_duration_ms = (time.perf_counter() - connect_started) * 1000.0
             source_ip, source_port = sock.getsockname()
             tcp_state = "tcp_connected"
+
+            if self.proxy_endpoint is not None:
+                connect_req = (
+                    f"CONNECT {destination_ip}:{destination_port} HTTP/1.1\r\n"
+                    f"Host: {destination_ip}:{destination_port}\r\n"
+                    f"Proxy-Connection: Keep-Alive\r\n\r\n"
+                ).encode("ascii")
+                sock.sendall(connect_req)
+                proxy_resp = bytearray()
+                while b"\r\n\r\n" not in proxy_resp:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("proxy_connect_eof")
+                    proxy_resp.extend(chunk)
+                    if len(proxy_resp) > 65536:
+                        raise RuntimeError("proxy_connect_response_too_large")
+                first_line = proxy_resp.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+                if " 200 " not in f" {first_line} ":
+                    raise RuntimeError(f"proxy_connect_failed:{first_line}")
+                tcp_state = "proxy_tunnel_established"
 
             tls_sock = self.ssl_context.wrap_socket(
                 sock,
@@ -1547,45 +1654,9 @@ class NetworkDiagnosticWorker:
 def load_config(config_path: Path) -> dict[str, Any]:
     user_cfg = parse_json_file(config_path)
     cfg = deep_merge(DEFAULT_CONFIG, user_cfg)
-
-    # Normalize and validate.
-    if not cfg["telegram"]["bot_token"]:
-        raise ValueError("telegram.bot_token is required")
-    if not cfg["telegram"]["personal_chat_id"]:
-        raise ValueError("telegram.personal_chat_id is required")
-
-    if cfg["delivery_verification"]["mode"] not in {"bot_api_ack", "user_reply_ack", "callback_ack"}:
-        raise ValueError("delivery_verification.mode must be one of: bot_api_ack, user_reply_ack, callback_ack")
-
-    verbosity = str(cfg["logging"]["verbosity"])
-    if verbosity not in VERBOSITY_MAX_LEVEL:
-        raise ValueError("logging.verbosity must be one of: normal, debug, trace")
-
-    for section, key in [
-        ("intervals_sec", "ping"),
-        ("intervals_sec", "traceroute"),
-        ("intervals_sec", "dns_reresolve"),
-        ("intervals_sec", "mtu_test"),
-        ("timeouts_ms", "connect"),
-        ("timeouts_ms", "request"),
-        ("timeouts_ms", "delivery_ack"),
-        ("timeouts_ms", "subprocess"),
-    ]:
-        value = int(cfg[section][key])
-        if value <= 0:
-            raise ValueError(f"{section}.{key} must be > 0")
-
-    if int(cfg["logging"]["max_total_size_mb"]) <= 0:
-        raise ValueError("logging.max_total_size_mb must be > 0")
-
-    if int(cfg["logging"]["max_file_size_mb"]) <= 0:
-        raise ValueError("logging.max_file_size_mb must be > 0")
-
-    max_total = int(cfg["logging"]["max_total_size_mb"])
-    max_file = int(cfg["logging"]["max_file_size_mb"])
-    if max_file > max_total:
-        raise ValueError("logging.max_file_size_mb must be <= logging.max_total_size_mb")
-
+    errors = validate_config_errors(cfg)
+    if errors:
+        raise ValueError("; ".join(errors))
     return cfg
 
 
@@ -1687,9 +1758,17 @@ def do_status(pid_file: Path) -> int:
 
 def do_validate(config_path: Path) -> int:
     try:
-        cfg = load_config(config_path)
+        user_cfg = parse_json_file(config_path)
+        cfg = deep_merge(DEFAULT_CONFIG, user_cfg)
     except Exception as exc:
-        print(f"invalid: {exc}")
+        print(f"invalid:\n - failed to parse config: {exc}")
+        return 2
+
+    errors = validate_config_errors(cfg)
+    if errors:
+        print("invalid:")
+        for err in errors:
+            print(f" - {err}")
         return 2
 
     print("valid")
@@ -1699,15 +1778,20 @@ def do_validate(config_path: Path) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OpenClaw standalone network diagnostics")
+    parser.add_argument("--config", help="Path to config JSON (default: NETDIAG_CONFIG or references/config.example.json)")
+    parser.add_argument("--proxy", help="Optional HTTP proxy URL for outbound Telegram checks (e.g. http://127.0.0.1:1082)")
+
     sub = parser.add_subparsers(dest="command", required=True)
 
     run_parser = sub.add_parser("run", help="Run in foreground until stopped")
-    run_parser.add_argument("--config", required=True, help="Path to config JSON")
+    run_parser.add_argument("--config", help="Path to config JSON")
+    run_parser.add_argument("--proxy", help="Override proxy URL")
     run_parser.add_argument("--pid-file", default="./logs/netdiag.pid", help="PID file path")
     run_parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
 
     start_parser = sub.add_parser("start", help="Start background worker")
-    start_parser.add_argument("--config", required=True, help="Path to config JSON")
+    start_parser.add_argument("--config", help="Path to config JSON")
+    start_parser.add_argument("--proxy", help="Override proxy URL")
     start_parser.add_argument("--pid-file", default="./logs/netdiag.pid", help="PID file path")
 
     stop_parser = sub.add_parser("stop", help="Stop background worker")
@@ -1717,21 +1801,55 @@ def parse_args() -> argparse.Namespace:
     status_parser.add_argument("--pid-file", default="./logs/netdiag.pid", help="PID file path")
 
     validate_parser = sub.add_parser("validate-config", help="Validate config and print merged config")
-    validate_parser.add_argument("--config", required=True, help="Path to config JSON")
+    validate_parser.add_argument("--config", help="Path to config JSON")
+    validate_parser.add_argument("--proxy", help="Override proxy URL")
 
     return parser.parse_args()
+
+
+def resolve_config_path_from_args(args: argparse.Namespace) -> Path:
+    raw = getattr(args, "config", None) or _find_default_config_path()
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {path}. Pass --config or set NETDIAG_CONFIG."
+        )
+    return path
+
+
+def apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    proxy = getattr(args, "proxy", None)
+    if proxy is not None:
+        cfg.setdefault("network", {})["proxy_url"] = proxy
+    return cfg
 
 
 def main() -> int:
     args = parse_args()
 
     if args.command == "run":
-        config_path = Path(args.config).expanduser().resolve()
+        try:
+            config_path = resolve_config_path_from_args(args)
+            cfg = apply_cli_overrides(load_config(config_path), args)
+            if getattr(args, "proxy", None) is not None:
+                config_path = config_path.parent / ".netdiag.runtime.config.json"
+                config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"Config error: {exc}", file=sys.stderr)
+            return 2
         pid_file = Path(args.pid_file).expanduser().resolve()
         return asyncio.run(run_worker(config_path=config_path, pid_file=pid_file))
 
     if args.command == "start":
-        config_path = Path(args.config).expanduser().resolve()
+        try:
+            config_path = resolve_config_path_from_args(args)
+            cfg = apply_cli_overrides(load_config(config_path), args)
+            if getattr(args, "proxy", None) is not None:
+                config_path = config_path.parent / ".netdiag.runtime.config.json"
+                config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"Config error: {exc}", file=sys.stderr)
+            return 2
         pid_file = Path(args.pid_file).expanduser().resolve()
         return do_start(config_path=config_path, pid_file=pid_file)
 
@@ -1744,7 +1862,11 @@ def main() -> int:
         return do_status(pid_file=pid_file)
 
     if args.command == "validate-config":
-        config_path = Path(args.config).expanduser().resolve()
+        try:
+            config_path = resolve_config_path_from_args(args)
+        except Exception as exc:
+            print(f"invalid:\n - {exc}")
+            return 2
         return do_validate(config_path=config_path)
 
     return 2
